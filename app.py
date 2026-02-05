@@ -15,53 +15,86 @@ def get_ist_now():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
 
 # --- Configuration ---
-st.set_page_config(page_title="Live Option Scanner", layout="wide")
+st.set_page_config(page_title="Intraday Option Scanner", layout="wide")
+
+# Client View Toggle (Hide Sidebar)
+client_view = st.checkbox("Enable Client View (Full Page)", value=False)
+
+if client_view:
+    st.markdown(
+        """
+        <style>
+            [data-testid="stSidebar"] {display: none;}
+            [data-testid="collapsedControl"] {display: none;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # Update time for header
-update_time = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
-st.markdown(f"""
-    <div style='display: flex; justify-content: space-between; align-items: center; margin-top: -20px; margin-bottom: 10px;'>
-        <h3 style='margin: 0;'>Live Option Scanner</h3>
-        <span style='font-size: 1rem; color: #555;'>Last Updated: {update_time} (IST)</span>
-    </div>
-""", unsafe_allow_html=True)
+if not client_view:
+    update_time = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
+    st.markdown(f"""
+        <div style='display: flex; justify-content: space-between; align-items: center; margin-top: -20px; margin-bottom: 10px;'>
+            <h3 style='margin: 0;'>Intraday Option Scanner</h3>
+            <span style='font-size: 1rem; color: #555;'>Last Updated: {update_time} (IST)</span>
+        </div>
+    """, unsafe_allow_html=True)
 
 # --- Sidebar Inputs ---
 st.sidebar.header("Configuration")
 
-# Try to get token from Secrets (Shared Mode) or Sidebar (Personal Mode)
-# Secrets are set in Streamlit Cloud Dashboard
-shared_token = None
-try:
-    if "UPSTOX_TOKEN" in st.secrets:
-        shared_token = st.secrets["UPSTOX_TOKEN"]
-except FileNotFoundError:
-    pass
+# --- Token Management ---
+TOKEN_FILE = ".token_cache"
 
-if shared_token:
-    access_token = shared_token
-    st.sidebar.success("✅ Shared Access Token Loaded")
-    # Optional: Allow override if needed, or just hide input
-    # override_token = st.sidebar.text_input("Override Token (Optional)", type="password")
-    # if override_token:
-    #     access_token = override_token
+def get_today_str():
+    """Get today's date in IST string format"""
+    return str(get_ist_now().date())
+
+def load_cached_token():
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                data = json.load(f)
+                if data.get("date") == get_today_str():
+                    return data.get("token")
+        except:
+            pass
+    return None
+
+def save_token_to_cache(token):
+    with open(TOKEN_FILE, "w") as f:
+        json.dump({"token": token, "date": get_today_str()}, f)
+
+# Input for Access Token (Frontend Only)
+cached_token = load_cached_token()
+access_token = st.sidebar.text_input("Enter Access Token", type="password", value=cached_token if cached_token else "")
+
+if access_token:
+    # If user entered a new token, save it
+    if access_token != cached_token:
+        save_token_to_cache(access_token)
+        st.sidebar.success("✅ New Token Saved for Today")
+    else:
+        st.sidebar.success("✅ Token Loaded from Cache (Valid for Today)")
 else:
-    access_token = st.sidebar.text_input("Access Token", type="password")
-
-if not access_token:
     st.warning("Please enter your Access Token in the sidebar to proceed.")
     st.stop()
 
 # --- Instruments Data Synchronization ---
 INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 INSTRUMENTS_FILE = 'NSE.json'
+CACHE_FILE = 'instruments_cache.pkl'
 
 def is_file_fresh(filepath):
     """Check if file exists and is from today"""
     if not os.path.exists(filepath):
         return False
-    file_time = datetime.datetime.fromtimestamp(os.path.getmtime(filepath))
-    return file_time.date() == datetime.date.today()
+    try:
+        file_time = datetime.datetime.fromtimestamp(os.path.getmtime(filepath))
+        return file_time.date() == datetime.date.today()
+    except:
+        return False
 
 def download_and_extract_instruments():
     """Download and unzip instruments file to NSE.json"""
@@ -94,91 +127,87 @@ def download_and_extract_instruments():
         return False
 
 # --- Data Loading ---
-@st.cache_data(ttl=3600*4)  # Cache for 4 hours
+@st.cache_data(ttl=3600*4, show_spinner=False)  # Cache for 4 hours
 def load_data():
-    # Check freshness and download if needed
-    if not is_file_fresh(INSTRUMENTS_FILE):
-        if not download_and_extract_instruments():
-             # If download failed, try to use existing file
-             if not os.path.exists(INSTRUMENTS_FILE):
+    df = None
+    
+    # 1. Try to load from fast pickle cache first
+    if is_file_fresh(CACHE_FILE):
+        try:
+            df = pd.read_pickle(CACHE_FILE)
+            # print("DEBUG: Loaded from Pickle Cache")
+        except Exception:
+            df = None
+
+    # 2. If no cache, load from raw JSON
+    if df is None:
+        # Check freshness and download if needed
+        if not is_file_fresh(INSTRUMENTS_FILE):
+            if not download_and_extract_instruments():
+                 # If download failed, try to use existing file
+                 if not os.path.exists(INSTRUMENTS_FILE):
+                     return pd.DataFrame(), pd.DataFrame()
+
+        # Load and Filter NSE.json directly
+        try:
+            with open(INSTRUMENTS_FILE, 'r') as f:
+                data = json.load(f)
+                
+            # Filter list before creating DataFrame
+            filtered_data = [
+                row for row in data 
+                if row.get('segment') == 'NSE_FO' and row.get('asset_type') in ['EQUITY', 'INDEX']
+            ]
+            
+            del data # Free huge memory immediately
+
+            if not filtered_data:
                  return pd.DataFrame(), pd.DataFrame()
 
-    # Load and Filter NSE.json directly
-    try:
-        # We need to filter WHILE loading to save memory if possible, 
-        # but standard json.load reads all. 
-        # So we load, filter immediately, then delete raw.
-        with open(INSTRUMENTS_FILE, 'r') as f:
-            data = json.load(f)
+            # Convert to DataFrame
+            df = pd.DataFrame(filtered_data)
+            del filtered_data # Free list memory
             
-        # DEBUG: Print data stats
-        print(f"DEBUG: Loaded {len(data)} records from NSE.json")
-        unique_segments = set(row.get('segment') for row in data[:1000]) # Check first 1000
-        print(f"DEBUG: Sample segments: {unique_segments}")
-
-        # Optimize: Filter list before creating DataFrame
-        filtered_data = [
-            row for row in data 
-            if row.get('segment') == 'NSE_FO' and row.get('asset_type') in ['EQUITY', 'INDEX']
-        ]
-        
-        print(f"DEBUG: Filtered down to {len(filtered_data)} records")
-
-        if not filtered_data:
-             st.error(f"No NSE_FO data found in NSE.json! Total records: {len(data)}. Segments found: {list(set(r.get('segment') for r in data[:5000]))}")
-             return pd.DataFrame(), pd.DataFrame()
-
-        del data # Free huge memory immediately
-
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        del filtered_data # Free list memory
-        
-        # 1. Options DF (All NSE_FO EQUITY/INDEX)
-        # This is used for looking up CE/PE
-        options_df = df.copy()
-        
-        # 2. Futures DF (Current Month FUT)
-        # Filter for FUT
-        df_fut = df[df['instrument_type'].str.contains('FUT', na=False)].copy()
-        
-        # Filter for Near Month Expiry (Nearest valid expiry >= Today)
-        if 'expiry' in df_fut.columns:
-            # Convert expiry from milliseconds to datetime for filtering
-            df_fut['expiry_dt'] = pd.to_datetime(df_fut['expiry'], unit='ms')
+            # Save to fast cache for next run
+            df.to_pickle(CACHE_FILE)
             
-            # Use IST date for comparison
-            current_date = get_ist_now().date()
-            
-            # Filter futures that haven't expired yet
-            # We want expiry >= today (or strictly > today if expired yesterday)
-            # Upstox removes expired contracts from NSE.json usually, but let's be safe.
-            active_futures = df_fut[df_fut['expiry_dt'].dt.date >= current_date]
-            
-            if not active_futures.empty:
-                # Find the nearest expiry date across ALL active futures
-                nearest_expiry = active_futures['expiry_dt'].min()
-                print(f"DEBUG: Found nearest expiry: {nearest_expiry}")
-                
-                # Filter only futures matching this nearest expiry (e.g., Feb if Jan is gone)
-                df_fut = active_futures[active_futures['expiry_dt'] == nearest_expiry]
-            else:
-                print("DEBUG: No active futures found (all expired?)")
-                df_fut = pd.DataFrame() # Force empty to trigger error
+        except Exception as e:
+            st.error(f"Error loading NSE.json: {e}")
+            return pd.DataFrame(), pd.DataFrame()
 
-            # Drop temp column
-            if not df_fut.empty:
-                df_fut = df_fut.drop(columns=['expiry_dt'])
-            
-        futures_df = df_fut
+    # --- Process DataFrames ---
+    
+    # 1. Options DF (All NSE_FO EQUITY/INDEX)
+    options_df = df.copy()
+    
+    # 2. Futures DF (Current Month FUT)
+    df_fut = df[df['instrument_type'].str.contains('FUT', na=False)].copy()
+    
+    # Filter for Near Month Expiry (Nearest valid expiry >= Today)
+    if 'expiry' in df_fut.columns:
+        # Convert expiry from milliseconds to datetime for filtering
+        df_fut['expiry_dt'] = pd.to_datetime(df_fut['expiry'], unit='ms')
         
-    except Exception as e:
-        st.error(f"Error loading NSE.json: {e}")
-        # DEBUG: Print detailed error to console
-        print(f"CRITICAL ERROR loading NSE.json: {e}")
-        import traceback
-        traceback.print_exc()
-        return pd.DataFrame(), pd.DataFrame()
+        # Use IST date for comparison
+        current_date = get_ist_now().date()
+        
+        # Filter futures that haven't expired yet
+        active_futures = df_fut[df_fut['expiry_dt'].dt.date >= current_date]
+        
+        if not active_futures.empty:
+            # Find the nearest expiry date across ALL active futures
+            nearest_expiry = active_futures['expiry_dt'].min()
+            
+            # Filter only futures matching this nearest expiry
+            df_fut = active_futures[active_futures['expiry_dt'] == nearest_expiry]
+        else:
+            df_fut = pd.DataFrame()
+
+        # Drop temp column
+        if not df_fut.empty:
+            df_fut = df_fut.drop(columns=['expiry_dt'])
+        
+    futures_df = df_fut
         
     # Convert expiry to datetime
     if 'expiry' in futures_df.columns:
@@ -207,7 +236,9 @@ def get_ohlc(instrument_key, token):
     }
     headers = {
         'Accept': 'application/json',
-        'Authorization': f'Bearer {token}'
+        'Authorization': f'Bearer {token}',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
     }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
@@ -225,7 +256,8 @@ def get_ltp(instrument_keys, token):
     params = {'instrument_key': instrument_keys}
     headers = {
         'Accept': 'application/json',
-        'Authorization': f'Bearer {token}'
+        'Authorization': f'Bearer {token}',
+        'Cache-Control': 'no-cache'
     }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
@@ -262,22 +294,15 @@ auto_refresh = st.sidebar.checkbox("Enable Auto-Refresh", value=False)
 refresh_interval = st.sidebar.number_input("Refresh Interval (seconds)", min_value=5, value=30, step=5)
 
 # Determine if we should run
-# Client View Toggle (Hide Sidebar)
-client_view = st.checkbox("Enable Client View (Full Page)", value=bool(shared_token))
-
-if client_view:
-    st.markdown(
-        """
-        <style>
-            [data-testid="stSidebar"] {display: none;}
-            [data-testid="collapsedControl"] {display: none;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-run_once = st.button("🔄 Refresh Data", type="primary")
+run_once = False
+if not client_view:
+    run_once = st.button("🔄 Refresh Data", type="primary")
+    
 should_run = run_once or auto_refresh
+
+# Define column name globally based on selection
+price_key = 'open' if atm_mode == "Fixed (Open Price)" else 'close'
+future_col_name = "Future Open" if atm_mode == "Fixed (Open Price)" else "Future LTP"
 
 if should_run:
     # --- Time Restriction Check (09:00 AM - 03:40 PM IST) ---
@@ -289,31 +314,36 @@ if should_run:
     is_market_closed = not (market_start <= ist_now <= market_end)
     
     if is_market_closed:
-        st.warning(f"⚠️ Market Closed ({ist_now.strftime('%H:%M:%S')} IST). Auto-refresh is disabled. Showing final data.")
+        if not client_view:
+            st.warning(f"⚠️ Market Closed ({ist_now.strftime('%H:%M:%S')} IST). Auto-refresh is disabled. Showing final data.")
         # Proceed to fetch data once so the user can see the last state.
     
     if auto_refresh:
-        st.caption(f"Auto-refreshing every {refresh_interval} seconds...")
+        if not client_view:
+            st.caption(f"Auto-refreshing every {refresh_interval} seconds...")
         
-    with st.spinner("Fetching and Calculating Data..."):
-        # 1. Get unique futures (one per symbol)
-        # Group by name and take the first one (assuming sorted by expiry/preference in CSV or just taking one)
-        # We already filtered for current month in the CSV generation step.
-        # To be safe, let's sort by expiry just in case
+    # --- Silent Update Logic ---
+    # We want to avoid 'shaking' which is caused by the spinner and progress bars appearing/disappearing.
+    # If client_view is ON, we suppress the spinner and progress bars.
+    
+    if client_view:
+        # No spinner, no progress bar
+        # Just run the logic directly. The user won't see a loading state, but the table will just update.
+        # This mimics the "silent update" behavior.
         futures_df_sorted = futures_df.sort_values('expiry_date')
         unique_futures = futures_df_sorted.drop_duplicates(subset=['name'], keep='first')
         
         all_results = []
         
         # Batch processing for Futures OHLC
-        # Split unique_futures into chunks
-        chunk_size = 20  # Reduced chunk size for better reliability
+        chunk_size = 20
         future_records = unique_futures.to_dict('records')
         total_records = len(future_records)
         
-        # Progress Bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        # No visible progress bar for client view
+        progress_bar = None
+        status_text = None
+        fetch_errors = []
         
         # Helper to calculate percentage change
         def calc_pct_change(ltp, cp):
@@ -323,8 +353,6 @@ if should_run:
 
         # We need to map Future Prices first
         future_prices = {} # {symbol_name: price}
-        price_key = 'open' if atm_mode == "Fixed (Open Price)" else 'close'
-        future_col_name = "Future Open" if atm_mode == "Fixed (Open Price)" else "Future LTP"
         
         # Prepare chunks
         chunks = [future_records[i:i+chunk_size] for i in range(0, total_records, chunk_size)]
@@ -357,73 +385,53 @@ if should_run:
             return results
 
         # Parallel Execution for Futures
-        status_text.text(f"Fetching Futures Data... (0/{total_records})")
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_to_chunk = {executor.submit(fetch_futures_chunk, chunk): i for i, chunk in enumerate(chunks)}
             
-            completed_count = 0
             for future in concurrent.futures.as_completed(future_to_chunk):
                 try:
                     chunk_results = future.result()
                     future_prices.update(chunk_results)
                 except Exception as e:
-                    # Log error but continue
-                    print(f"Error fetching futures chunk: {e}")
-                    pass
-                
-                completed_count += 1
-                # Update Progress
-                progress = min((completed_count / total_chunks) * 0.5, 0.5)
-                progress_bar.progress(progress)
-                status_text.text(f"Fetching Futures Data... ({completed_count * chunk_size}/{total_records})")
+                    fetch_errors.append(f"Futures Fetch Error: {str(e)}")
 
         # Prepare Option Keys to Fetch
         option_keys_to_fetch = []
         symbol_atm_map = {} # {symbol: {atm_strike, ce_key, pe_key}}
         
-        # Optimization: Pre-filter and Group Options
-        # 1. Filter only CE/PE
-        # 2. Filter only symbols we have futures for
         relevant_options_df = options_df[
             (options_df['instrument_type'].isin(['CE', 'PE'])) &
             (options_df['name'].isin(future_prices.keys()))
         ]
         
-        # Optimize Datetime Conversion ONCE (Vectorized)
-        # Convert expiry to date object for faster comparison
         if not relevant_options_df.empty:
              relevant_options_df['expiry_date_obj'] = relevant_options_df['expiry_date'].dt.date
         
-        # 3. Group by symbol for O(1) access
         options_grouped = relevant_options_df.groupby('name')
         
         for i, (symbol, ref_price) in enumerate(future_prices.items()):
             if ref_price <= 0: continue
             
-            # Get options for this symbol from grouped dict
             if symbol not in options_grouped.groups:
                 continue
                 
             opts_group = options_grouped.get_group(symbol)
             
-            # Get expiry from future record
             f_rec = unique_futures[unique_futures['name'] == symbol].iloc[0]
             f_expiry = f_rec['expiry_date'].date()
             
-            # Filter by expiry (fast operation on small subset)
-            # Use the pre-converted column
+            # Extract short symbol for display
+            short_symbol = f_rec.get('asset_symbol') or f_rec.get('underlying_symbol') or symbol
+            
             opts = opts_group[opts_group['expiry_date_obj'] == f_expiry]
             
             if opts.empty: continue
             
-            # Find nearest strike
             unique_strikes = sorted(opts['strike_price'].unique())
             if not unique_strikes: continue
             
             atm_strike = min(unique_strikes, key=lambda x: abs(x - ref_price))
             
-            # Get CE and PE keys
-            # Use boolean masking on small dataframe
             ce_row = opts[(opts['strike_price'] == atm_strike) & (opts['instrument_type'] == 'CE')]
             pe_row = opts[(opts['strike_price'] == atm_strike) & (opts['instrument_type'] == 'PE')]
             
@@ -439,7 +447,8 @@ if should_run:
                 'ce_key': ce_key,
                 'pe_key': pe_key,
                 'ce_lot': ce_lot,
-                'pe_lot': pe_lot
+                'pe_lot': pe_lot,
+                'display_symbol': short_symbol
             }
             
             if ce_key: option_keys_to_fetch.append(ce_key)
@@ -447,215 +456,481 @@ if should_run:
             
         # Batch Fetch Options Data
         options_data_map = {}
-        
         total_opt_keys = len(option_keys_to_fetch)
         
-        # Function to process options chunk
         def fetch_options_chunk(chunk_keys):
-            # Upstox V3 API expects | in instrument_key (e.g. NSE_FO|12345)
-            # Do NOT replace with : as that causes 400 Bad Request
             keys_str = ",".join(chunk_keys)
             return get_ltp(keys_str, access_token)
 
         if total_opt_keys > 0:
             opt_chunks = [option_keys_to_fetch[i:i+chunk_size] for i in range(0, total_opt_keys, chunk_size)]
-            total_opt_chunks = len(opt_chunks)
-            
-            status_text.text(f"Fetching Options Data... (0/{total_opt_keys})")
-
-            # DEBUG: Check first chunk keys and response
-            # if opt_chunks:
-            #     first_chunk = opt_chunks[0]
-            #     # Show keys as they will be sent
-            #     debug_keys_str = ",".join(first_chunk)
-            #     st.write(f"DEBUG: First Chunk Keys (Request): {debug_keys_str}")
-            #     try:
-            #         debug_resp = get_ltp(debug_keys_str, access_token)
-            #         st.write(f"DEBUG: First Chunk Response Keys: {list(debug_resp.keys()) if debug_resp else 'Empty Response'}")
-            #     except Exception as ex:
-            #         st.error(f"DEBUG: First Chunk Error: {ex}")
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 future_to_chunk = {executor.submit(fetch_options_chunk, chunk): i for i, chunk in enumerate(opt_chunks)}
                 
-                completed_count = 0
                 for future in concurrent.futures.as_completed(future_to_chunk):
                     try:
                         ltp_data = future.result()
                         if ltp_data:
                             options_data_map.update(ltp_data)
                     except Exception as e:
-                        # Log error but continue
-                        print(f"Error fetching options chunk: {e}")
+                        fetch_errors.append(f"Options Fetch Error: {str(e)}")
+        
+        if fetch_errors:
+            st.error(f"Errors occurred during data fetch ({len(fetch_errors)}). Data might be incomplete.")
+            with st.expander("View Errors"):
+                for err in fetch_errors:
+                    st.write(err)
+        
+    else:
+        # Standard View with Spinner and Progress
+        with st.spinner("Fetching and Calculating Data..."):
+            futures_df_sorted = futures_df.sort_values('expiry_date')
+            unique_futures = futures_df_sorted.drop_duplicates(subset=['name'], keep='first')
+            
+            all_results = []
+            
+            # Batch processing for Futures OHLC
+            chunk_size = 20
+            future_records = unique_futures.to_dict('records')
+            total_records = len(future_records)
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Helper to calculate percentage change
+            def calc_pct_change(ltp, cp):
+                if ltp is not None and cp and cp > 0:
+                    return ((ltp - cp) / cp) * 100
+                return 0.0
+
+            # We need to map Future Prices first
+            future_prices = {} # {symbol_name: price}
+            
+            chunks = [future_records[i:i+chunk_size] for i in range(0, total_records, chunk_size)]
+            total_chunks = len(chunks)
+            
+            def fetch_futures_chunk(chunk):
+                keys = ",".join([r['instrument_key'] for r in chunk])
+                ohlc_data = get_ohlc(keys, access_token)
+                results = {}
+                if ohlc_data:
+                    lookup_map = {}
+                    for k, v in ohlc_data.items():
+                        lookup_map[k] = v
+                        if 'instrument_token' in v:
+                            lookup_map[v['instrument_token']] = v
+                    
+                    for record in chunk:
+                        key = record['instrument_key']
+                        data = lookup_map.get(key)
+                        if not data:
+                            alt_key = key.replace('|', ':')
+                            data = lookup_map.get(alt_key)
+                        
+                        if data:
+                            ohlc_source = data.get('live_ohlc') or data.get('prev_ohlc')
+                            if ohlc_source:
+                                results[record['name']] = ohlc_source.get(price_key, 0.0)
+                return results
+
+            if status_text:
+                status_text.text(f"Fetching Futures Data... (0/{total_records})")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_chunk = {executor.submit(fetch_futures_chunk, chunk): i for i, chunk in enumerate(chunks)}
+                
+                completed_count = 0
+                for future in concurrent.futures.as_completed(future_to_chunk):
+                    try:
+                        chunk_results = future.result()
+                        future_prices.update(chunk_results)
+                    except Exception as e:
+                        print(f"Error fetching futures chunk: {e}")
                         pass
                     
                     completed_count += 1
-                    # Update Progress
-                    progress = 0.5 + min((completed_count / total_opt_chunks) * 0.5, 0.5)
-                    progress_bar.progress(progress)
-                    status_text.text(f"Fetching Options Data... ({completed_count * chunk_size}/{total_opt_keys})")
+                    progress = min((completed_count / total_chunks) * 0.5, 0.5)
+                    if progress_bar:
+                        progress_bar.progress(progress)
+                    if status_text:
+                        status_text.text(f"Fetching Futures Data... ({completed_count * chunk_size}/{total_records})")
 
-        # Cleanup Progress
-        progress_bar.progress(1.0)
-        status_text.text("Finalizing Data...")
-        time.sleep(0.5)
-        progress_bar.empty()
-        status_text.empty()
-
-        if total_opt_keys > 0 and not options_data_map:
-             st.error("Failed to fetch Options Data (LTP). Please check your Access Token or Internet Connection.")
-
-        # Optimize Lookup for Options
-        # Create a fast lookup map for options_data_map
-        fast_options_map = {}
-        for k, v in options_data_map.items():
-            fast_options_map[k] = v
+            # Prepare Option Keys to Fetch
+            option_keys_to_fetch = []
+            symbol_atm_map = {} # {symbol: {atm_strike, ce_key, pe_key}}
             
-            # Map by Token from the VALUE object if available
-            # This is the most robust way because the API might return keys in a different format
-            if isinstance(v, dict) and 'instrument_token' in v:
-                token = v['instrument_token']
-                if token:
-                    fast_options_map[str(token)] = v
+            relevant_options_df = options_df[
+                (options_df['instrument_type'].isin(['CE', 'PE'])) &
+                (options_df['name'].isin(future_prices.keys()))
+            ]
             
-            # Fallback: Map by Token (suffix) from the key
-            # Key format is typically SEGMENT|TOKEN or SEGMENT:TOKEN
-            try:
-                token_from_key = k.replace(':', '|').split('|')[-1]
-                fast_options_map[token_from_key] = v
-            except:
-                pass
+            if not relevant_options_df.empty:
+                 relevant_options_df['expiry_date_obj'] = relevant_options_df['expiry_date'].dt.date
             
-        # DEBUG: Show sample of map if empty
-        if not fast_options_map and total_opt_keys > 0:
-             st.warning(f"Options Data Map is empty! Sent {total_opt_keys} keys.")
-
-        # Construct Final DataFrame
-        final_rows = []
-        for symbol, info in symbol_atm_map.items():
-            row = {
-                "Stock Name": symbol,
-                future_col_name: info['ref_price'],
-                "ATM Strike": info['atm_strike']
-            }
+            options_grouped = relevant_options_df.groupby('name')
             
-            # Helper to get data with fallback
-            def get_opt_data(key):
-                if not key: return None
-                # Try exact match
-                d = fast_options_map.get(key)
-                if d: return d
+            for i, (symbol, ref_price) in enumerate(future_prices.items()):
+                if ref_price <= 0: continue
                 
-                # Try token match (extract token from request key)
-                try:
-                    tok = key.replace(':', '|').split('|')[-1]
-                    return fast_options_map.get(tok)
-                except:
-                    return None
-
-            # CE Data
-            ce_key = info['ce_key']
-            ce_ltp = 0
-            ce_pct = 0
-            ce_vol = 0
-            ce_ctr = 0
-            
-            if ce_key:
-                # Optimized lookup
-                data = get_opt_data(ce_key)
-                if data:
-                    ce_ltp = data.get('last_price', 0)
-                    ce_vol = data.get('volume', 0)
-                    ce_pct = calc_pct_change(ce_ltp, data.get('cp', 0))
-                    # Calculate Contracts
-                    lot_size = info.get('ce_lot', 0)
-                    if lot_size > 0 and ce_vol > 0:
-                         ce_ctr = ce_vol / lot_size
-            
-            row["CE LTP"] = ce_ltp
-            row["CE Change %"] = round(ce_pct, 2)
-            row["CE Volume"] = ce_vol
-            row["CE Contracts"] = int(ce_ctr)
-            
-            # PE Data
-            pe_key = info['pe_key']
-            pe_ltp = 0
-            pe_pct = 0
-            pe_vol = 0
-            pe_ctr = 0
-            
-            if pe_key:
-                # Optimized lookup
-                data = get_opt_data(pe_key)
-                if data:
-                    pe_ltp = data.get('last_price', 0)
-                    pe_vol = data.get('volume', 0)
-                    pe_pct = calc_pct_change(pe_ltp, data.get('cp', 0))
-                    # Calculate Contracts
-                    lot_size = info.get('pe_lot', 0)
-                    if lot_size > 0 and pe_vol > 0:
-                         pe_ctr = pe_vol / lot_size
+                if symbol not in options_grouped.groups:
+                    continue
                     
-            row["PE LTP"] = pe_ltp
-            row["PE Change %"] = round(pe_pct, 2)
-            row["PE Volume"] = pe_vol
-            row["PE Contracts"] = int(pe_ctr)
+                opts_group = options_grouped.get_group(symbol)
+                
+                f_rec = unique_futures[unique_futures['name'] == symbol].iloc[0]
+                f_expiry = f_rec['expiry_date'].date()
+                
+                # Extract short symbol for display
+                short_symbol = f_rec.get('asset_symbol') or f_rec.get('underlying_symbol') or symbol
+                
+                opts = opts_group[opts_group['expiry_date_obj'] == f_expiry]
+                
+                if opts.empty: continue
+                
+                unique_strikes = sorted(opts['strike_price'].unique())
+                if not unique_strikes: continue
+                
+                atm_strike = min(unique_strikes, key=lambda x: abs(x - ref_price))
+                
+                ce_row = opts[(opts['strike_price'] == atm_strike) & (opts['instrument_type'] == 'CE')]
+                pe_row = opts[(opts['strike_price'] == atm_strike) & (opts['instrument_type'] == 'PE')]
+                
+                ce_key = ce_row.iloc[0]['instrument_key'] if not ce_row.empty else None
+                pe_key = pe_row.iloc[0]['instrument_key'] if not pe_row.empty else None
+                
+                ce_lot = ce_row.iloc[0]['lot_size'] if not ce_row.empty else 0
+                pe_lot = pe_row.iloc[0]['lot_size'] if not pe_row.empty else 0
+                
+                symbol_atm_map[symbol] = {
+                    'ref_price': ref_price,
+                    'atm_strike': atm_strike,
+                    'ce_key': ce_key,
+                    'pe_key': pe_key,
+                    'ce_lot': ce_lot,
+                    'pe_lot': pe_lot,
+                    'display_symbol': short_symbol
+                }
+                
+                if ce_key: option_keys_to_fetch.append(ce_key)
+                if pe_key: option_keys_to_fetch.append(pe_key)
+                
+            # Batch Fetch Options Data
+            options_data_map = {}
+            total_opt_keys = len(option_keys_to_fetch)
             
-            final_rows.append(row)
-            
-        df_results = pd.DataFrame(final_rows)
+            def fetch_options_chunk(chunk_keys):
+                keys_str = ",".join(chunk_keys)
+                return get_ltp(keys_str, access_token)
 
-        # Ensure ATM Strike is numeric and rounded for clean display
-        if not df_results.empty and "ATM Strike" in df_results.columns:
-            df_results["ATM Strike"] = df_results["ATM Strike"].astype(float).round(2)
+            if total_opt_keys > 0:
+                opt_chunks = [option_keys_to_fetch[i:i+chunk_size] for i in range(0, total_opt_keys, chunk_size)]
+                total_opt_chunks = len(opt_chunks)
+                
+                if status_text:
+                    status_text.text(f"Fetching Options Data... (0/{total_opt_keys})")
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    future_to_chunk = {executor.submit(fetch_options_chunk, chunk): i for i, chunk in enumerate(opt_chunks)}
+                    
+                    completed_count = 0
+                    for future in concurrent.futures.as_completed(future_to_chunk):
+                        try:
+                            ltp_data = future.result()
+                            if ltp_data:
+                                options_data_map.update(ltp_data)
+                        except Exception as e:
+                            print(f"Error fetching options chunk: {e}")
+                            pass
+                        
+                        completed_count += 1
+                        progress = 0.5 + min((completed_count / total_opt_chunks) * 0.5, 0.5)
+                        if progress_bar:
+                            progress_bar.progress(progress)
+                        if status_text:
+                            status_text.text(f"Fetching Options Data... ({completed_count * chunk_size}/{total_opt_keys})")
+
+            # Cleanup Progress
+            if progress_bar:
+                progress_bar.progress(1.0)
+            if status_text:
+                status_text.text("Finalizing Data...")
+            time.sleep(0.5)
+            if progress_bar:
+                progress_bar.empty()
+            if status_text:
+                status_text.empty()
+    
+    # Common Logic to Process Results (Outside the if/else)
+    # This part was common in both branches, so we can keep it here.
+    # However, since I duplicated the fetching logic (which is slightly different for progress bars),
+    # I need to ensure variables like options_data_map, symbol_atm_map, total_opt_keys are available.
+    
+    if total_opt_keys > 0 and not options_data_map:
+            if not client_view:
+                st.error("Failed to fetch Options Data (LTP). Please check your Access Token or Internet Connection.")
+
+    # Optimize Lookup for Options
+    # Create a fast lookup map for options_data_map
+    fast_options_map = {}
+    for k, v in options_data_map.items():
+        fast_options_map[k] = v
         
-        # Rename Stock Name to include timestamp for fullscreen visibility
-        time_str = get_ist_now().strftime("%H:%M:%S")
-        df_results = df_results.rename(columns={"Stock Name": f"Stock Name ({time_str})"})
-    
-    # Styling Function
-    def highlight_ce_pe(row):
-        styles = []
-        for col in row.index:
-            if str(col).startswith("CE"):
-                styles.append('background-color: #e6ffe6; color: black') # Light Green
-            elif str(col).startswith("PE"):
-                styles.append('background-color: #ffe6e6; color: black') # Light Red
-            else:
-                styles.append('')
-        return styles
+        # Map by Token from the VALUE object if available
+        # This is the most robust way because the API might return keys in a different format
+        if isinstance(v, dict) and 'instrument_token' in v:
+            token = v['instrument_token']
+            if token:
+                fast_options_map[str(token)] = v
+        
+        # Fallback: Map by Token (suffix) from the key
+        # Key format is typically SEGMENT|TOKEN or SEGMENT:TOKEN
+        try:
+            token_from_key = k.replace(':', '|').split('|')[-1]
+            fast_options_map[token_from_key] = v
+        except:
+            pass
+        
+    # DEBUG: Show sample of map if empty
+    if not fast_options_map and total_opt_keys > 0:
+            st.warning(f"Options Data Map is empty! Sent {total_opt_keys} keys.")
 
-    # Display
-    
-    # Calculate height to show all rows (approx 35px per row + header)
-    table_height = (len(df_results) + 1) * 35 + 3
+    # Construct Final DataFrame
+    final_rows = []
+    for symbol, info in symbol_atm_map.items():
+        row = {
+            "Stock Name": info.get('display_symbol', symbol),
+            future_col_name: info['ref_price'],
+            "ATM Strike": info['atm_strike']
+        }
+        
+        # Helper to get data with fallback
+        def get_opt_data(key):
+            if not key: return None
+            # Try exact match
+            d = fast_options_map.get(key)
+            if d: return d
+            
+            # Try token match (extract token from request key)
+            try:
+                tok = key.replace(':', '|').split('|')[-1]
+                return fast_options_map.get(tok)
+            except:
+                return None
 
-    # Apply styling and explicit alignment
-    styler = df_results.style.apply(highlight_ce_pe, axis=1)
-    if "ATM Strike" in df_results.columns:
-        styler = styler.set_properties(subset=['ATM Strike'], **{'text-align': 'right'})
+        # CE Data
+        ce_key = info['ce_key']
+        ce_ltp = 0
+        ce_pct = 0
+        ce_vol = 0
+        ce_ctr = 0
+        
+        if ce_key:
+            # Optimized lookup
+            data = get_opt_data(ce_key)
+            if data:
+                ce_ltp = data.get('last_price', 0)
+                ce_vol = data.get('volume', 0)
+                ce_pct = calc_pct_change(ce_ltp, data.get('cp', 0))
+                # Calculate Contracts
+                lot_size = info.get('ce_lot', 0)
+                if lot_size > 0 and ce_vol > 0:
+                        ce_ctr = ce_vol / lot_size
+        
+        row["CE LTP"] = ce_ltp
+        row["CE Change %"] = round(ce_pct, 2)
+        row["CE Volume"] = ce_vol
+        row["CE Contracts"] = int(ce_ctr)
+        
+        # PE Data
+        pe_key = info['pe_key']
+        pe_ltp = 0
+        pe_pct = 0
+        pe_vol = 0
+        pe_ctr = 0
+        
+        if pe_key:
+            # Optimized lookup
+            data = get_opt_data(pe_key)
+            if data:
+                pe_ltp = data.get('last_price', 0)
+                pe_vol = data.get('volume', 0)
+                pe_pct = calc_pct_change(pe_ltp, data.get('cp', 0))
+                # Calculate Contracts
+                lot_size = info.get('pe_lot', 0)
+                if lot_size > 0 and pe_vol > 0:
+                        pe_ctr = pe_vol / lot_size
+                
+        row["PE LTP"] = pe_ltp
+        row["PE Change %"] = round(pe_pct, 2)
+        row["PE Volume"] = pe_vol
+        row["PE Contracts"] = int(pe_ctr)
+        
+        final_rows.append(row)
+        
+    df_results = pd.DataFrame(final_rows)
 
-    st.dataframe(
-        styler,
-        column_config={
-            future_col_name: st.column_config.NumberColumn(format="%.2f"),
-            "ATM Strike": st.column_config.NumberColumn(format="%g"),
-            "CE LTP": st.column_config.NumberColumn(format="%.2f"),
-            "PE LTP": st.column_config.NumberColumn(format="%.2f"),
-            "CE Change %": st.column_config.NumberColumn(format="%.2f%%"),
-            "PE Change %": st.column_config.NumberColumn(format="%.2f%%"),
-            "CE Contracts": st.column_config.NumberColumn(format="%d"),
-            "PE Contracts": st.column_config.NumberColumn(format="%d"),
-        },
-        use_container_width=True,
-        hide_index=True,
-        height=table_height
-    )
+    # Ensure ATM Strike is numeric and rounded for clean display
+    if not df_results.empty and "ATM Strike" in df_results.columns:
+        df_results["ATM Strike"] = df_results["ATM Strike"].astype(float).round(2)
     
-    # Handle Auto-Refresh Loop
-    if auto_refresh and not is_market_closed:
+    # Fixed Stock Name to prevent table shaking
+    stock_col_name = "Stock Name"
+    
+    # Save snapshot to session state
+    st.session_state['data_snapshot'] = {
+        'df': df_results,
+        'stock_col_name': stock_col_name,
+        'future_col_name': future_col_name
+    }
+
+# --- Display Logic (from Session State) ---
+if 'data_snapshot' in st.session_state and st.session_state['data_snapshot']:
+    snapshot = st.session_state['data_snapshot']
+    df_results = snapshot['df']
+    stock_col_name = snapshot['stock_col_name']
+    
+    # Use the stored future_col_name if available, otherwise fallback to current global
+    snap_future_col = snapshot.get('future_col_name', future_col_name)
+    
+    # Check if the column actually exists (in case of stale state mismatch)
+    if snap_future_col not in df_results.columns:
+        # Try to find a column starting with "Future"
+        fut_cols = [c for c in df_results.columns if str(c).startswith("Future")]
+        if fut_cols:
+            snap_future_col = fut_cols[0]
+    
+    # Split into CE and PE DataFrames
+    ce_cols = [c for c in [stock_col_name, snap_future_col, "ATM Strike", "CE LTP", "CE Change %", "CE Volume", "CE Contracts"] if c in df_results.columns]
+    pe_cols = [c for c in [stock_col_name, snap_future_col, "ATM Strike", "PE LTP", "PE Change %", "PE Volume", "PE Contracts"] if c in df_results.columns]
+    
+    df_ce = df_results[ce_cols].copy()
+    df_pe = df_results[pe_cols].copy()
+    
+    # Auto-Sort by Change % (Descending)
+    if not df_ce.empty and "CE Change %" in df_ce.columns:
+        df_ce = df_ce.sort_values(by="CE Change %", ascending=False)
+    if not df_pe.empty and "PE Change %" in df_pe.columns:
+        df_pe = df_pe.sort_values(by="PE Change %", ascending=False)
+
+    # Rename columns for compact display
+    
+    # Create combined Symbol column
+    if not df_ce.empty:
+        # Format strike to remove decimals if integer
+        df_ce['TempStrike'] = df_ce['ATM Strike'].apply(lambda x: f"{int(x)}" if x == int(x) else f"{x}")
+        # Assuming stock_col_name is 'Stock Name' in df_ce before rename
+        # But wait, rename happens AFTER this block in my previous code?
+        # No, I am editing the block where rename happens.
+        # df_ce currently has columns from ce_cols which includes stock_col_name ("Stock Name") and "ATM Strike"
+        
+        # Use underlying symbol if available, otherwise stock name
+        # Since we don't have underlying symbol column in df_results explicitly separate from Stock Name (which is Name),
+        # We will just use the Stock Name. If it's long, we might need to truncate, but user asked to combine.
+        # "JUBLFOOD 525 CE"
+        
+        df_ce['DisplaySymbol'] = df_ce[stock_col_name].astype(str) + " " + df_ce['TempStrike'] + " CE"
+        
+    if not df_pe.empty:
+        df_pe['TempStrike'] = df_pe['ATM Strike'].apply(lambda x: f"{int(x)}" if x == int(x) else f"{x}")
+        df_pe['DisplaySymbol'] = df_pe[stock_col_name].astype(str) + " " + df_pe['TempStrike'] + " PE"
+
+    rename_map_ce = {
+        "DisplaySymbol": "Symbol",
+        snap_future_col: "Open",
+        "CE LTP": "LTP",
+        "CE Change %": "Chg%",
+        "CE Volume": "Vol",
+        "CE Contracts": "Ctr"
+    }
+    rename_map_pe = {
+        "DisplaySymbol": "Symbol",
+        snap_future_col: "Open",
+        "PE LTP": "LTP",
+        "PE Change %": "Chg%",
+        "PE Volume": "Vol",
+        "PE Contracts": "Ctr"
+    }
+    
+    # Select only the columns we want to show
+    # We drop Stock Name and ATM Strike
+    
+    if not df_ce.empty:
+        df_ce = df_ce.rename(columns=rename_map_ce)
+        # Reorder to put Symbol first
+        cols = ["Symbol", "Open", "LTP", "Chg%", "Vol", "Ctr"]
+        # Filter strictly
+        df_ce = df_ce[[c for c in cols if c in df_ce.columns]]
+        
+    if not df_pe.empty:
+        df_pe = df_pe.rename(columns=rename_map_pe)
+        cols = ["Symbol", "Open", "LTP", "Chg%", "Vol", "Ctr"]
+        df_pe = df_pe[[c for c in cols if c in df_pe.columns]]
+
+    # Display Side-by-Side
+    
+    # Display Last Updated Time (outside table to prevent shaking)
+    time_str = get_ist_now().strftime("%H:%M:%S")
+    st.markdown(f"<h5 style='text-align: center; color: #333; margin-bottom: 5px;'>Last Updated: {time_str}</h5>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    table_height = (max(len(df_ce), len(df_pe)) + 1) * 35 + 3
+
+    with col1:
+        if not client_view:
+             st.subheader("CE Data (Sorted by Change %)")
+        
+        # Apply Styling
+        styler_ce = df_ce.style.set_properties(**{'background-color': '#e6ffe6', 'color': 'black'})
+        # Apply white background to Symbol
+        if "Symbol" in df_ce.columns:
+            styler_ce = styler_ce.set_properties(subset=["Symbol"], **{'background-color': 'white'})
+        
+        st.dataframe(
+            styler_ce,
+            column_config={
+                "Symbol": st.column_config.TextColumn(label="Symbol"),
+                "Open": st.column_config.NumberColumn(format="%.2f"),
+                "LTP": st.column_config.NumberColumn(format="%.2f"),
+                "Chg%": st.column_config.NumberColumn(format="%.2f%%"),
+                "Ctr": st.column_config.NumberColumn(format="%d"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=table_height
+        )
+
+    with col2:
+        if not client_view:
+             st.subheader("PE Data (Sorted by Change %)")
+             
+        # Apply Styling
+        styler_pe = df_pe.style.set_properties(**{'background-color': '#ffe6e6', 'color': 'black'})
+        # Apply white background to Symbol
+        if "Symbol" in df_pe.columns:
+            styler_pe = styler_pe.set_properties(subset=["Symbol"], **{'background-color': 'white'})
+        
+        st.dataframe(
+            styler_pe,
+            column_config={
+                "Symbol": st.column_config.TextColumn(label="Symbol"),
+                "Open": st.column_config.NumberColumn(format="%.2f"),
+                "LTP": st.column_config.NumberColumn(format="%.2f"),
+                "Chg%": st.column_config.NumberColumn(format="%.2f%%"),
+                "Ctr": st.column_config.NumberColumn(format="%d"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=table_height
+        )
+
+# Handle Auto-Refresh Loop
+if should_run and auto_refresh:
+    # is_market_closed is defined inside the if should_run block above
+    if not is_market_closed:
         time.sleep(refresh_interval)
         st.rerun()
 
-elif not should_run:
-    st.info("Click 'Load All Stocks Data' or enable 'Auto-Refresh' in the sidebar to start.")
+if not should_run and 'data_snapshot' not in st.session_state:
+    if not client_view:
+        st.info("Click 'Load All Stocks Data' or enable 'Auto-Refresh' in the sidebar to start.")
